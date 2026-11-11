@@ -1,3 +1,514 @@
+<!-- 中文说明开始 -->
+
+# 🇨🇳 中文详细说明 · KiCAD MCP Server
+
+> **本节是给中文读者写的通俗版说明，完整技术文档请看下面的英文原文（上游 README）。**
+> 原文从「↓ 上游 README 原文开始 ↓」这一行往下，从未删改。
+
+---
+
+## 一、这是什么（一句话说清）
+
+**KiCAD MCP Server 是一个「给 AI 用的转接头」，让 AI 助手（比如 Claude、Claude Code、Cline、OpenCode）能够直接操作 KiCAD 这个开源的 PCB（印刷电路板）设计软件。**
+
+打个比方：
+
+- **KiCAD** = 专业画电路板的设计软件，功能强但要会点鼠标、会懂封装/走线/DRC 这些专业概念。
+- **MCP Server** = 一个「翻译 + 遥控器」。它把 KiCAD 的 244 个专业动作（放元件、连线、跑 DRC 检查、导出 Gerber 文件……）包装成 AI 能调用的工具。
+- **AI 客户端**（Claude Desktop / Claude Code / Cline / OpenCode）= 你的「设计师助手」。你用大白话说需求，AI 翻译成具体动作，通过这个转接头去指挥 KiCAD。
+
+**MCP** 全称 Model Context Protocol（模型上下文协议），是 Anthropic 提出的一个开放标准 —— 简单说就是「让 AI 安全地连接外部工具和数据源」的通用接口规范。这个项目同时实现了 **Responses / Chat Completions / Anthropic Messages** 三种 AI 接口风格的调用链。
+
+### 一句话效果对比
+
+| 你想要的 | 传统做法（手动） | 用本项目 |
+| --- | --- | --- |
+| 画一块 5V 供电的降压电路 | 打开 KiCAD → 搜库 → 放 3 个元件 → 连 6 根线 → 改封装 → 跑检查 → 导出 Gerber | 对 AI 说「帮我画一个 5V→3.3V 的降压电路，元件从嘉立创立创商城选」，AI 一步步调工具做完 |
+| 检查有没有短路 | 手动点 DRC 一项项看 | AI 调 `run_drc`，把违规清单整理成表格告诉你 |
+| 出一份 BOM（物料清单） | 手动导出 CSV 再手动整理 | AI 调 `export_bom`，顺便把报价、成本一起列出来 |
+
+---
+
+## 二、适合谁用 / 能解决什么问题
+
+### ✅ 适合你，如果你是这几类人
+
+| 你是 | 你会得到什么 |
+| --- | --- |
+| **硬件/PCB 工程师，想让 AI 帮干活** | 你描述电路，AI 真的在 KiCAD 里放器件、连线、跑检查、出文件 |
+| **电气/嵌入式学生** | 用自然语言「学」原理图和布局，不用先啃 KiCAD 那一堆菜单 |
+| **产品经理/创业团队** | 快速验证一个电路方案，看板子大概长什么样，不用等外包 |
+| **AI 工程师，想做硬件方向的 Agent** | 现成的 244 个工具 + JSON Schema 描述，可以直接拿来当你的 Agent 工具集 |
+| **需要批量出图的工厂/实验室** | `batch_add_components` 这类批量工具，加上 IPC 后端能实时同步到 KiCAD 界面 |
+
+### 🎯 能解决的具体痛点
+
+1. **「AI 只会写代码，不会画板子」** —— 这是行业里普遍的问题。文本模型能生成网表，但没法直接操作 EDA（电子设计自动化）软件。本项目补上了这一段。
+2. **重复劳动** —— 100 个电阻要手动一个个放？`batch_add_components` 一次搞定。
+3. **选器件** —— 内置嘉立创（JLCPCB）接口，能查 250 万+ 元件库，还能读 LCSC 数据手册。
+4. **看不懂别人的工程** —— 让 AI 读你的 `.kicad_pro` / `.kicad_pcb` / `.kicad_sch`，把原理图、网络、封装讲成人话。
+5. **导出格式繁多** —— Gerber、钻孔、IPC-2581、ODB++、STEP、BOM、贴片坐标文件，一次对话全部导出。
+
+---
+
+## 三、核心功能（244 个工具，17 个分类）
+
+先看一张总表——**每个数字都是从仓库真实代码里统计出来的**（见 `docs/TOOL_INVENTORY.md`，由 `npm run docs:tools` 自动生成）：
+
+| 分类 | 工具数 | 干什么的 | 几个典型工具名 |
+| --- | ---: | --- | --- |
+| 项目管理 | 12 | 建工程、开关工程、存盘、快照 | `create_project` `open_project` `save_board` `snapshot_project` |
+| 板子操作 | 19 | 画板框、加层、铺铜、加安装孔、导入 SVG logo | `set_board_size` `add_board_outline` `add_zone` `import_svg_logo` |
+| 元件管理 | 28 | 放置/移动/旋转/删除/对齐/成组元件 | `place_component` `batch_move_components` `check_placement_clearance` |
+| 走线布线 | 17 | 加网络、连线、过孔、差分线、GND 缝合 | `route_trace` `route_pad_to_pad` `route_differential_pair` |
+| 原理图 | 46 | 放符号、连线、层级页、标注、ERC、出网表 | `add_schematic_component` `add_hierarchical_sheet` `annotate_schematic` |
+| 文件校验 | 2 | 检查 `.kicad_sch` / `.kicad_sym` 格式 | `validate_schematic` `validate_symbol_library` |
+| 设计规则 DRC | 7 | 设置规则、跑检查、看违规 | `run_drc` `get_drc_violations` `create_netclass` |
+| 导出 | 27 | Gerber/钻孔/BOM/网表/贴片坐标/3D 模型 | `export_gerber` `export_bom` `export_position_file` `export_3d` |
+| 封装与符号库 | 16 | 管理本地库、搜索符号 | `search_symbols` `list_library_symbols` |
+| 封装/符号创建器 | 7 + 8 | 从零造自定义封装和符号 | `create_footprint` `create_symbol` |
+| 数据手册工具 | 2 | 读数据手册内容 | `read_datasheet` |
+| 嘉立创集成 | 5 | 查元件、下载元件库、比对封装 | `get_jlcpcb_part` `search_jlcpcb_parts` |
+| Freerouting 自动布线 | 4 | 调用开源自动布线器 | `run_freerouting` `check_freerouting` |
+| UI 管理 | 3 | 启动/检测 KiCAD 界面 | `check_kicad_ui` `launch_kicad` |
+| 元件登记表 | 3 | 项目级元件清单 | `list_registered_parts` |
+| 导入 | 2 | 导入 Eagle 工程、SVG logo | `import_eagle` `import_svg_logo` |
+
+### 值得单独说的 6 个亮点
+
+1. **两种后端可切换（Hybrid Backend）**
+   - **SWIG 后端**（默认）：直接用 KiCAD 的 Python 绑定 `pcbnew` 读写文件。**不需要开着 KiCAD**，适合服务器/批处理。
+   - **IPC 后端**（实验性）：通过 KiCAD 官方 IPC 接口和正在运行的 KiCAD 实时通信。**改了东西 KiCAD 界面立刻能看到**。
+   - 程序会自动探测：有 IPC 就用 IPC，没有就退回 SWIG。也可以用 `setup-windows-opencode.ps1 -Backend swig` 强制指定。
+
+2. **元件搜索不用联网也能用**
+   `.env` 里不填嘉立创密钥时，`search_jlcpcb_parts` 会走本地快照库（用 `download_jlcpcb_database` 下载）。**网络不通也能查元件**。
+
+3. **工具发现机制**
+   244 个工具全量暴露给客户端会撑爆上下文，所以有 184 个被编入 17 个分类的索引，AI 可以先调 `search_tools("电源")` 找工具，再调对应工具干活。
+
+4. **原理图 46 个工具是重点**
+   包含层级页（多页原理图）、批量编辑、字段美化、网格对齐、ERC（电气规则检查）、网表生成、`sync_schematic_to_board`（相当于 KiCAD 里的 F8 快捷键）。
+
+5. **Freerouting 自动布线**
+   支持 Docker / Podman 跑 Java 版 Freerouting，不用在本机装 Java。
+
+6. **23 个 Resource（资源）**
+   除了「动作」，还提供「状态读取」：当前工程信息、板子信息、元件列表、库列表等等，AI 可以随时「看一眼」项目现在是什么样。
+
+---
+
+## 四、怎么快速上手（命令全部来自仓库真实文件）
+
+### 4.1 先决条件
+
+| 需要什么 | 最低版本 | 怎么验证 |
+| --- | --- | --- |
+| **KiCAD** | 9.0 或更高（**必须带 Python 模块 pcbnew**） | `python3 -c "import pcbnew; print(pcbnew.GetBuildVersion())"` |
+| **Node.js** | 18 或更高 | `node --version` && `npm --version` |
+| **Python** | 3.9 或更高（KiCAD 自带） | `python3 --version` |
+| **MCP 客户端** | 任选一个 | Claude Desktop / Claude Code / Cline / OpenCode |
+
+> ⚠️ **最常见的坑**：KiCAD 装的时候必须包含 Python 组件。装了 KiCAD 但 `import pcbnew` 报错，就是漏了这一项。
+
+### 4.2 Linux（Ubuntu / Debian）安装
+
+```bash
+# 1) 装 KiCAD 9.0+
+sudo add-apt-repository --yes ppa:kicad/kicad-9.0-releases
+sudo apt-get update
+sudo apt-get install -y kicad kicad-libraries
+
+# 2) 装 Node.js
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt-get install -y nodejs
+
+# 3) 克隆并编译
+git clone --branch stable https://github.com/mixelpixx/KiCAD-MCP-Server.git
+cd KiCAD-MCP-Server
+npm install
+pip3 install -r requirements.txt
+npm run build
+
+# 4) 验证
+python3 -c "import pcbnew; print(pcbnew.GetBuildVersion())"
+ls dist/index.js        # 这个文件必须存在，否则客户端起不来
+```
+
+> **`--branch stable` 是什么意思？** `stable` 分支只在一个版本正式发布时才动，装到的永远是稳定版。想要「还没发布但已修复」的最新代码，就去掉 `--branch stable` 用默认的 `main`。
+
+### 4.3 Windows 10/11 安装（推荐一键脚本）
+
+```powershell
+git clone --branch stable https://github.com/mixelpixx/KiCAD-MCP-Server.git
+cd KiCAD-MCP-Server
+.\setup-windows.ps1
+```
+
+这个脚本会自动做 6 件事：
+1. 扫描 KiCAD 安装位置（同时支持 `C:\Program Files\KiCad` 全机安装 和 `%LOCALAPPDATA%\Programs\KiCad` 单用户安装）
+2. 检查先决条件
+3. 装依赖
+4. 编译项目
+5. 生成 MCP 配置
+6. 跑一遍诊断
+
+如果手动装，看 `docs/PLATFORM_GUIDE.md`；装失败看 `docs/WINDOWS_TROUBLESHOOTING.md`。
+
+### 4.4 macOS 安装（必须用 KiCAD 自带的 Python）
+
+```bash
+brew install node@20
+
+git clone --branch stable https://github.com/mixelpixx/KiCAD-MCP-Server.git
+cd KiCAD-MCP-Server
+
+# 用 KiCAD 自带的 Python 建虚拟环境
+/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3 \
+  -m venv venv --system-site-packages
+
+source venv/bin/activate
+
+npm install
+pip install -r requirements.txt
+npm run build
+```
+
+> ⚠️ **`--system-site-packages` 这个参数不能省** —— 省了虚拟环境就看不到 `pcbnew` 模块，服务器启动不了，客户端 30 秒超时但**看不到任何报错**，非常折磨人。
+>
+> 实在不想建虚拟环境，就得用 KiCAD 的解释器直接装：
+> ```bash
+> /Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3 \
+>   -m pip install --user -r requirements.txt
+> ```
+
+macOS 还有个便捷脚本 `setup-macos.sh`（自动生成 Claude Desktop 配置）：
+
+```bash
+chmod +x setup-macos.sh     # 或者直接 bash setup-macos.sh
+
+./setup-macos.sh --verify   # 只检查环境，不改任何东西
+./setup-macos.sh --dry-run  # 预览将要写入的配置
+./setup-macos.sh --apply    # 真正写入配置
+```
+
+### 4.5 配置 MCP 客户端
+
+#### Claude Desktop
+
+配置文件位置：
+
+| 系统 | 路径 |
+| --- | --- |
+| Linux | `~/.config/Claude/claude_desktop_config.json` |
+| macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
+
+内容：
+
+```json
+{
+  "mcpServers": {
+    "kicad": {
+      "command": "node",
+      "args": ["/path/to/KiCAD-MCP-Server/dist/index.js"],
+      "env": {
+        "PYTHONPATH": "/path/to/kicad/python",
+        "LOG_LEVEL": "info"
+      }
+    }
+  }
+}
+```
+
+`PYTHONPATH` 按平台填（**这一项填错是最常见的失败原因**）：
+
+| 系统 | PYTHONPATH |
+| --- | --- |
+| Linux | `/usr/lib/kicad/lib/python3/dist-packages` |
+| Windows | `C:\Program Files\KiCad\10.0\lib\python3\dist-packages` 或 `%LOCALAPPDATA%\Programs\KiCad\10.0\lib\python3\dist-packages` |
+| macOS | `/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/3.9/lib/python3.9/site-packages` |
+
+**Linux 上通常不用配 PYTHONPATH** —— 服务端会按这个顺序自动找 Python：
+1. 虚拟环境 `venv/bin/python` 或 `.venv/bin/python`
+2. `KICAD_PYTHON` 环境变量（你手动指定的）
+3. KiCAD 自带的 `/usr/lib/kicad/bin/python3` 等
+4. `which python3` 解析出的绝对路径
+5. `/usr/bin/python3`、`/bin/python3`
+
+#### Claude Code（命令行）
+
+Claude Code **不读** Claude Desktop 的配置，也不自动发现这个服务器。要手动加：
+
+```bash
+claude mcp add --scope user kicad \
+  --env KICAD_PYTHON=/usr/bin/python3 \
+  --env PYTHONPATH=/usr/lib/kicad/lib/python3/dist-packages \
+  --env LOG_LEVEL=info \
+  -- node /path/to/KiCAD-MCP-Server/dist/index.js
+```
+
+`--scope user` 表示所有项目都能用；想写成可分享的项目配置用 `--scope project`。
+验证：`claude mcp list`，应该看到 ✔ Connected。
+
+#### VS Code（GitHub Copilot）
+
+```bash
+cp config/vscode-mcp.example.json .vscode/mcp.json
+```
+
+模板用的是 `${workspaceFolder}` 变量，**不需要改路径**。VS Code 会自动识别 `.vscode/mcp.json`。（这个文件在 `.gitignore` 里，不会被提交。）
+
+#### Cline（VS Code 插件）
+
+编辑 `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`，格式同 Claude Desktop。
+
+#### OpenCode（Windows）
+
+用仓库自带的 `setup-windows-opencode.ps1`：
+
+```powershell
+.\setup-windows-opencode.ps1 -Apply -Scope project -Backend auto
+```
+
+`-Backend` 三个取值：`auto`（默认，优先 IPC，失败退回 SWIG）、`ipc`（强制 IPC，需要 KiCAD 开着）、`swig`（强制文件模式）。
+
+### 4.6 验证装好了没
+
+1. **完全退出并重启 MCP 客户端**（不是关窗口，要在托盘里彻底退出）
+2. Claude Desktop 里点 **+ → Connectors**，应该能看到 `kicad` 这个服务器
+3. 新开一个对话，输入：
+
+```text
+Use the kicad MCP server to run check_kicad_ui.
+```
+
+4. **看服务器日志**（出问题时第一件事就是看这个）：
+
+```bash
+# Linux / macOS
+ls ~/.kicad-mcp/logs/
+cat ~/.kicad-mcp/logs/kicad_interface-<pid>.log
+```
+
+### 4.7 开发者常用命令
+
+```bash
+npm run build          # 编译 TypeScript → dist/
+npm run dev            # 监听编译 + nodemon 热重启
+npm test               # 跑全部测试（TS + Python）
+npm run test:ts        # 只跑 vitest
+npm run test:py        # 只跑 pytest
+npm run lint           # eslint + black + mypy + flake8
+npm run format         # prettier + black
+npm run docs:tools     # 重新生成 docs/TOOL_INVENTORY.md
+```
+
+---
+
+## 五、常见问题 / 注意事项（真的会踩的坑）
+
+### 坑 1：客户端里根本看不到这个服务器
+
+**症状**：Claude Desktop / Cline 里找不到 `kicad`。
+
+按顺序排查：
+1. `ls dist/index.js` —— 这个文件不存在说明**没编译**，跑 `npm run build`
+2. 配置里的路径**必须是绝对路径**，不能用 `./` 或相对路径
+3. **完全重启客户端**（托盘图标右键退出，不是关窗口）
+4. 看客户端日志报错
+
+### 坑 2：`ModuleNotFoundError: No module named 'pcbnew'`
+
+**症状**：服务器启动了但每个工具都报错。
+
+**原因**：Python 找不到 KiCAD 的模块。
+
+**解法**：
+1. 确认 KiCAD 装了 Python 组件：`python3 -c "import pcbnew"`
+2. 检查配置里的 `PYTHONPATH` 是不是和你实际装的 KiCAD 版本对得上（**KiCAD 9 和 10 的路径不一样**）
+3. macOS 上必须用 KiCAD 自带 Python，不能用系统的 `pip3`
+
+### 坑 3：macOS 上 30 秒超时，什么错都不报
+
+**原因**：依赖装到了系统 Python，但服务器用的是 KiCAD 的 Python。
+
+**解法**：见 4.4 节，必须用 KiCAD 的解释器装依赖，或者建带 `--system-site-packages` 的虚拟环境。
+
+### 坑 4：改完了，KiCAD 界面里看不到变化
+
+**原因**：**这是设计如此，不是 bug**。SWIG 后端直接改文件，推不动正在运行的界面。
+
+**解法**：
+- 用 IPC 后端（需要 KiCAD 开着并启用 IPC）
+- 或者在 KiCAD 里手动重新加载文件
+- 或者干脆不开 KiCAD —— 文件已经是改好的
+
+### 坑 5：铺铜（copper zone）不填充，甚至崩溃
+
+**症状**：SWIG 后端下 `add_zone` 建了铜皮但没填充；调 `ZONE_FILLER` 可能 segfault。
+
+**解法**：
+1. 换 IPC 后端（IPC 下填充正常）
+2. 在 KiCAD 里打开这个板子，它会自动填充
+3. 试 `refill_zones` 工具（部分环境仍然会崩）
+
+### 坑 6：`get_board_info` 在 KiCAD 9.0 上报 `LT_USER` 属性错误
+
+**原因**：KiCAD 9.0 改了图层枚举常量。
+
+**解法**：用 `get_project_info` 拿基本信息。影响很小，只是信息类命令。
+
+### 坑 7：`.kicad_pro` 里的网络分类（net class）设置被搞没了
+
+**原因**：项目的 net_settings（网络类规则）必须通过 JSON 合并的方式改，不能整体重写文件。
+
+**解法**：用 `set_design_rules` / `create_netclass` / `assign_net_to_class` 这几个专门的工具，不要手动改 `.kicad_pro`。
+
+### 坑 8：扁平厂商符号（flat vendor symbol）让 kicad-skip 系工具报错
+
+**原因**：某些厂商库里的符号是「扁平」结构（没有正常的单元层级），kicad-skip 解析不了。
+
+**解法**：这个已被诊断出来，用 `dynamic_symbol_loader` 相关工具路径；临时方案是换用 KiCAD 标准库的符号。
+
+### 坑 9：多开服务器抢同一个日志文件
+
+v2.7.0 之前有这个问题（#373），现在每个进程一个日志文件（`kicad_interface-<pid>.log`），已修复。
+
+### 坑 10：Windows 路径里的反斜杠
+
+配置 JSON 里写 `C:\Program Files\KiCad\10.0` 会被 JSON 解析成转义字符。**要写成 `C:\\Program Files\\KiCad\\10.0`**（双反斜杠），或者直接用正斜杠 `C:/Program Files/KiCad/10.0`。
+
+---
+
+## 六、目录结构速览
+
+```
+KiCAD-MCP-Server/
+├── src/                    ← TypeScript 层（MCP 协议实现、工具定义）
+│   ├── index.ts              MCP 服务器主入口
+│   ├── tools/                244 个工具的 Schema 定义（按类别分文件）
+│   │   ├── registry.ts        工具分类与「必选工具」清单
+│   │   ├── router.ts          search_tools / get_category_tools 发现机制
+│   │   ├── project.ts         项目类工具
+│   │   ├── board.ts           板子类工具
+│   │   ├── schematic.ts       原理图工具（最大的一块）
+│   │   ├── export.ts          导出工具
+│   │   ├── jlcpcb-api.ts      嘉立创接口
+│   │   └── ...                其余分类
+│   ├── resources/            23 个 Resource（项目/板子/元件/库的只读状态）
+│   ├── prompts/              预置提示词
+│   └── utils/                工具函数
+├── python/                  ← Python 层（真正干活的代码）
+│   ├── kicad_interface.py     MCP 消息处理器 + 命令路由（主入口）
+│   ├── kicad_api/
+│   │   ├── base.py            后端抽象基类
+│   │   ├── ipc_backend.py     KiCAD 9.0 IPC 后端（实时同步）
+│   │   ├── swig_backend.py    pcbnew SWIG 后端（文件操作）
+│   │   └── factory.py         后端自动探测与实例化
+│   ├── commands/             按领域拆分的命令实现（60+ 个文件）
+│   │   ├── project.py board.py component.py routing.py
+│   │   ├── schematic.py schematic_batch.py schematic_hierarchy.py
+│   │   ├── export.py design_rules.py jlcpcb.py digikey.py
+│   │   └── ...
+│   ├── schemas/              全部工具的 JSON Schema 定义
+│   ├── parsers/              S-expression 文件解析
+│   ├── templates/            新建工程/原理图的模板
+│   └── utils/                辅助函数
+├── gui_driver_plugin/       KiCAD GUI 驱动插件（实验性，opt-in）
+├── config/                  各平台 MCP 配置模板
+│   ├── claude-desktop-config.json
+│   ├── windows-config.example.json
+│   ├── macos-config.example.json
+│   ├── linux-config.example.json
+│   ├── vscode-mcp.example.json
+│   └── opencode.json
+├── docs/                    32 篇详细文档
+│   ├── INDEX.md               文档总索引
+│   ├── TOOL_INVENTORY.md      244 个工具的完整清单（自动生成）
+│   ├── ARCHITECTURE.md        架构说明
+│   ├── CLIENT_CONFIGURATION.md 客户端配置详解
+│   ├── FREEROUTING_GUIDE.md   自动布线指南
+│   ├── JLCPCB_INTEGRATION.md  嘉立创集成
+│   ├── KNOWN_ISSUES.md        已知问题与绕过方法
+│   ├── WINDOWS_TROUBLESHOOTING.md
+│   └── ...
+├── scripts/                 工具脚本（工具清单生成、发布、格式化等）
+├── tests/                   Python 测试（pytest）
+├── tests-ts/                TypeScript 测试（vitest）
+├── resources/               图标等静态资源
+├── package.json             Node 依赖与脚本
+├── requirements.txt         Python 依赖
+├── pyproject.toml / pytest.ini / vitest.config.ts
+├── setup-windows.ps1              Windows 一键安装
+├── setup-windows-opencode.ps1    Windows + OpenCode 配置脚本
+├── setup-macos.sh                 macOS 一键配置
+├── download_jlcpcb.py             嘉立创元件库本地快照下载
+├── .env.example                   嘉立创 / Digi-Key 密钥模板
+└── CHANGELOG.md / CONTRIBUTING.md / LICENSE (MIT)
+```
+
+### 关键文件一句话解释
+
+| 文件/目录 | 一句话说明 |
+| --- | --- |
+| `src/index.ts` | MCP 协议层入口，负责握手、收命令、转发给 Python |
+| `src/tools/registry.ts` | 工具清单和分类索引，AI 用它「找工具」 |
+| `python/kicad_interface.py` | 命令路由中枢，把工具名映射到具体 Python 实现 |
+| `python/kicad_api/factory.py` | 决定用 IPC 还是 SWIG 的决策点 |
+| `python/commands/schematic.py` | 原理图 46 个工具的实体 |
+| `config/*.json` | 复制粘贴就能用的 MCP 配置，不用自己想 |
+| `docs/TOOL_INVENTORY.md` | 想了解「到底能干什么」就看这份 |
+| `.env.example` | 需要外部 API 密钥时才用；不填也能跑大部分功能 |
+
+---
+
+## 七、本仓库说明
+
+| 项目 | 说明 |
+| --- | --- |
+| **本仓库** | `aiwozhonghua81/KiCAD-MCP-Server` —— 一个 **fork（派生仓库）** |
+| **上游项目** | **KiCAD-MCP-Server** |
+| **上游地址** | https://github.com/mixelpixx/KiCAD-MCP-Server |
+| **上游作者** | mixelpixx 及社区贡献者 |
+| **许可证** | MIT（商业友好，可自由使用与闭源分发） |
+| **本仓库改动** | 仅在 README 顶部新增本中文说明区块；**未修改任何源码文件** |
+
+### README 的结构
+
+```
+┌─────────────────────────────────────────────┐
+│  👆 本节：中文详细说明（面向普通读者）        │  ← 本次新增
+├─────────────────────────────────────────────┤
+│  👇 下方：上游 README 原文（英文，未删改）    │  ← 上游 mixelpixx 撰写
+└─────────────────────────────────────────────┘
+```
+
+- 上游 README 共 **1927 行**，内容非常详尽，包含 v2.8.2 / v2.8.1 / v2.8.0 … 各版本的更新日志、完整工具清单、各平台安装步骤、Claude Desktop / Copilot / Cline / Claude Code / OpenCode 的配置方法、架构说明、排错指南等。**这些内容完整保留在下方，请放心查阅。**
+- 本中文区块是**导读和翻译**，不替代原文。遇到英文技术细节，以原文为准。
+- 上游正在开发下一代项目 **Konnect**（Rust 重写的 KiCAD 10 原生插件，171 个工具）。本 Python/TypeScript 服务仍是 MIT 完全开源并持续维护。
+
+---
+
+## 📌 快速自查清单
+
+装之前先确认这 6 件事，全 ✔ 再动手，能省下 90% 的排错时间：
+
+- [ ] KiCAD ≥ 9.0 已安装，且 `import pcbnew` 不报错
+- [ ] Node.js ≥ 18 已安装
+- [ ] `npm run build` 成功，`dist/index.js` 存在
+- [ ] 客户端配置里的路径是**绝对路径**
+- [ ] `PYTHONPATH` 里的 KiCAD 版本号和你实际装的**一致**
+- [ ] 配置改完后**完全重启**了 MCP 客户端
+
+---
+
+<!-- 中文说明结束 -->
+
+---
+
+↓ **上游 README 原文开始**（以下内容来自 [mixelpixx/KiCAD-MCP-Server](https://github.com/mixelpixx/KiCAD-MCP-Server)，未做任何删改） ↓
+
 # Discussions. Get in here.
 
 https://github.com/mixelpixx/KiCAD-MCP-Server/discussions/73
